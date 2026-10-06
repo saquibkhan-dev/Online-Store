@@ -2,7 +2,7 @@
 
 Next.js storefront + API gateway + six Node/Express/Prisma services (user, product, inventory, order, payment,
 notification) coordinated by Kafka using the transactional-outbox and idempotent-consumer patterns.
-Read `docs/ARCHITECTURE.md` first, then `docs/SECURITY_AUDIT.md` and `docs/PRODUCTION_READINESS.md` (what was found, fixed, and what is and is not verified).
+
 
 ## Run it
 ```sh
