@@ -1,0 +1,202 @@
+# Production-shaped stack. Secrets come from .env (see .env.example); the stack refuses to start without them.
+# TLS is expected to terminate in front of nginx (load balancer / ingress).
+# Local development: add `-f docker-compose.dev.yml` to publish ports and enable the payment sandbox.
+
+x-service: &service
+  restart: unless-stopped
+  networks: [backend]
+  read_only: true
+  tmpfs: [/tmp]
+  cap_drop: [ALL]
+  security_opt: ["no-new-privileges:true"]
+  stop_grace_period: 20s
+  logging: { driver: json-file, options: { max-size: "10m", max-file: "5" } }
+
+x-common-env: &common-env
+  NODE_ENV: production
+  LOG_LEVEL: ${LOG_LEVEL:-info}
+  INTERNAL_SERVICE_TOKEN: ${INTERNAL_SERVICE_TOKEN:?set INTERNAL_SERVICE_TOKEN}
+
+x-kafka-env: &kafka-env
+  KAFKA_BROKERS: kafka:9092
+  KAFKA_REPLICATION_FACTOR: ${KAFKA_REPLICATION_FACTOR:-1}
+
+x-health: &health
+  interval: 10s
+  timeout: 3s
+  retries: 6
+  start_period: 60s
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    networks: [backend]
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD}
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:?set APP_DB_PASSWORD}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./infrastructure/postgres/init.sh:/docker-entrypoint-initdb.d/init.sh:ro
+    healthcheck: { test: ["CMD-SHELL", "pg_isready -U postgres"], interval: 5s, timeout: 3s, retries: 12 }
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    networks: [backend]
+    command: ["redis-server", "--save", "", "--appendonly", "no", "--maxmemory", "128mb", "--maxmemory-policy", "allkeys-lru"]
+    healthcheck: { test: ["CMD", "redis-cli", "ping"], interval: 5s, timeout: 3s, retries: 12 }
+
+  kafka:
+    image: apache/kafka:3.9.0
+    restart: unless-stopped
+    networks: [backend]
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,PLAINTEXT:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      KAFKA_LOG_RETENTION_HOURS: 168
+    volumes: [kafkadata:/var/lib/kafka/data]
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 30s
+
+  user-service:
+    <<: *service
+    build: { context: ., dockerfile: infrastructure/docker/service.Dockerfile, args: { SERVICE: user-service } }
+    environment:
+      <<: *common-env
+      PORT: 4001
+      DATABASE_URL: postgresql://users_svc:${APP_DB_PASSWORD}@postgres:5432/users
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?set JWT_ACCESS_SECRET}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+    depends_on: { postgres: { condition: service_healthy } }
+    healthcheck: { <<: *health, test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4001/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"] }
+
+  product-service:
+    <<: *service
+    build: { context: ., dockerfile: infrastructure/docker/service.Dockerfile, args: { SERVICE: product-service } }
+    environment:
+      <<: *common-env
+      PORT: 4002
+      DATABASE_URL: postgresql://products_svc:${APP_DB_PASSWORD}@postgres:5432/products
+    depends_on: { postgres: { condition: service_healthy } }
+    healthcheck: { <<: *health, test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4002/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"] }
+
+  inventory-service:
+    <<: *service
+    build: { context: ., dockerfile: infrastructure/docker/service.Dockerfile, args: { SERVICE: inventory-service } }
+    environment:
+      <<: [*common-env, *kafka-env]
+      PORT: 4003
+      DATABASE_URL: postgresql://inventory_svc:${APP_DB_PASSWORD}@postgres:5432/inventory
+    depends_on: { postgres: { condition: service_healthy }, kafka: { condition: service_healthy } }
+    healthcheck: { <<: *health, test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4003/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"] }
+
+  order-service:
+    <<: *service
+    build: { context: ., dockerfile: infrastructure/docker/service.Dockerfile, args: { SERVICE: order-service } }
+    environment:
+      <<: [*common-env, *kafka-env]
+      PORT: 4004
+      DATABASE_URL: postgresql://orders_svc:${APP_DB_PASSWORD}@postgres:5432/orders
+      PRODUCT_SERVICE_URL: http://product-service:4002
+    depends_on:
+      postgres: { condition: service_healthy }
+      kafka: { condition: service_healthy }
+      product-service: { condition: service_healthy }
+    healthcheck: { <<: *health, test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4004/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"] }
+
+  payment-service:
+    <<: *service
+    build: { context: ., dockerfile: infrastructure/docker/service.Dockerfile, args: { SERVICE: payment-service } }
+    environment:
+      <<: [*common-env, *kafka-env]
+      PORT: 4005
+      DATABASE_URL: postgresql://payments_svc:${APP_DB_PASSWORD}@postgres:5432/payments
+      PAYMENT_WEBHOOK_SECRET: ${PAYMENT_WEBHOOK_SECRET:?set PAYMENT_WEBHOOK_SECRET}
+    depends_on: { postgres: { condition: service_healthy }, kafka: { condition: service_healthy } }
+    healthcheck: { <<: *health, test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4005/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"] }
+
+  notification-service:
+    <<: *service
+    build: { context: ., dockerfile: infrastructure/docker/service.Dockerfile, args: { SERVICE: notification-service } }
+    environment:
+      <<: [*common-env, *kafka-env]
+      PORT: 4006
+      DATABASE_URL: postgresql://notifications_svc:${APP_DB_PASSWORD}@postgres:5432/notifications
+    depends_on: { postgres: { condition: service_healthy }, kafka: { condition: service_healthy } }
+    healthcheck: { <<: *health, test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4006/ready').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"] }
+
+  api-gateway:
+    <<: *service
+    build: { context: ., dockerfile: infrastructure/docker/service.Dockerfile, args: { SERVICE: api-gateway } }
+    environment:
+      <<: *common-env
+      PORT: 4000
+      JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?set JWT_ACCESS_SECRET}
+      REDIS_URL: redis://redis:6379
+      USER_SERVICE_URL: http://user-service:4001
+      PRODUCT_SERVICE_URL: http://product-service:4002
+      INVENTORY_SERVICE_URL: http://inventory-service:4003
+      ORDER_SERVICE_URL: http://order-service:4004
+      PAYMENT_SERVICE_URL: http://payment-service:4005
+      NOTIFICATION_SERVICE_URL: http://notification-service:4006
+      CORS_ORIGINS: ${CORS_ORIGINS:-}
+      TRUST_PROXY_HOPS: 1
+    depends_on:
+      redis: { condition: service_healthy }
+      user-service: { condition: service_healthy }
+      product-service: { condition: service_healthy }
+      inventory-service: { condition: service_healthy }
+      order-service: { condition: service_healthy }
+      payment-service: { condition: service_healthy }
+      notification-service: { condition: service_healthy }
+    healthcheck: { <<: *health, test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"] }
+
+  web:
+    <<: *service
+    build: { context: ., dockerfile: infrastructure/docker/web.Dockerfile }
+    read_only: false
+    environment:
+      API_URL: http://api-gateway:4000
+    depends_on: { api-gateway: { condition: service_healthy } }
+    healthcheck: { <<: *health, test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/login').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"] }
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    networks: [backend, edge]
+    ports: ["${HTTP_PORT:-8080}:8080"]
+    environment:
+      # Redirect http -> https when the load balancer reports the visitor used http. Set to false only for local dev.
+      FORCE_HTTPS: ${FORCE_HTTPS:-true}
+    volumes:
+      - ./infrastructure/nginx/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - nginxcache:/var/cache/nginx
+    depends_on: { web: { condition: service_healthy }, api-gateway: { condition: service_healthy } }
+    healthcheck: { test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8080/healthz"], interval: 10s, timeout: 3s, retries: 5 }
+
+networks:
+  backend: { internal: true }
+  edge: {}
+
+volumes:
+  pgdata: {}
+  kafkadata: {}
+  nginxcache: {}

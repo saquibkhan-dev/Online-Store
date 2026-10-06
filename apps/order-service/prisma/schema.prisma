@@ -1,0 +1,114 @@
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated"
+  moduleFormat = "cjs"
+  engineType   = "client"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum OrderStatus {
+  PENDING
+  PAYMENT_PENDING
+  CONFIRMED
+  CANCELLED
+}
+
+model Cart {
+  id        String     @id @default(uuid()) @db.Uuid
+  userId    String     @unique @db.Uuid
+  createdAt DateTime   @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime   @updatedAt @db.Timestamptz(3)
+  items     CartItem[]
+}
+
+model CartItem {
+  id        String   @id @default(uuid()) @db.Uuid
+  cartId    String   @db.Uuid
+  productId String   @db.Uuid
+  quantity  Int
+  createdAt DateTime @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime @updatedAt @db.Timestamptz(3)
+  cart      Cart     @relation(fields: [cartId], references: [id], onDelete: Cascade)
+
+  @@unique([cartId, productId])
+}
+
+/// (userId, idempotencyKey) is unique so a retried checkout can never create a second order.
+model Order {
+  id             String      @id @default(uuid()) @db.Uuid
+  userId         String      @db.Uuid
+  status         OrderStatus @default(PENDING)
+  totalMinor     Int
+  currency       String      @db.Char(3)
+  idempotencyKey String
+  correlationId  String      @db.Uuid
+  cancelReason   String?
+  createdAt      DateTime    @default(now()) @db.Timestamptz(3)
+  updatedAt      DateTime    @updatedAt @db.Timestamptz(3)
+  items          OrderItem[]
+
+  @@unique([userId, idempotencyKey])
+  @@index([userId, createdAt])
+  @@index([status, updatedAt])
+}
+
+/// Name and price are snapshots taken at checkout so history stays correct when the catalogue changes.
+model OrderItem {
+  id             String @id @default(uuid()) @db.Uuid
+  orderId        String @db.Uuid
+  productId      String @db.Uuid
+  productName    String
+  unitPriceMinor Int
+  quantity       Int
+  order          Order  @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@index([orderId])
+}
+
+model AuditLog {
+  id           String   @id @default(uuid()) @db.Uuid
+  actorId      String?
+  action       String
+  resourceType String
+  resourceId   String
+  metadata     Json
+  createdAt    DateTime @default(now()) @db.Timestamptz(3)
+
+  @@index([resourceType, resourceId])
+  @@index([action, createdAt])
+}
+
+/// Transactional outbox: written in the same transaction as the state change, published to Kafka by the relay.
+model OutboxEvent {
+  id            String    @id @default(uuid()) @db.Uuid
+  eventId       String    @unique @db.Uuid
+  eventType     String
+  aggregateId   String    @db.Uuid
+  version       Int       @default(1)
+  correlationId String    @db.Uuid
+  causationId   String?   @db.Uuid
+  payload       Json
+  status        String    @default("PENDING")
+  retryCount    Int       @default(0)
+  nextAttemptAt DateTime  @default(now()) @db.Timestamptz(3)
+  lockedUntil   DateTime? @db.Timestamptz(3)
+  lastAttemptAt DateTime? @db.Timestamptz(3)
+  lastError     String?
+  publishedAt   DateTime? @db.Timestamptz(3)
+  createdAt     DateTime  @default(now()) @db.Timestamptz(3)
+
+  @@index([status, nextAttemptAt, createdAt])
+}
+
+/// Consumer deduplication: inserting (eventId, consumerName) is the first step of every handler transaction.
+model ProcessedEvent {
+  eventId      String   @db.Uuid
+  consumerName String
+  processedAt  DateTime @default(now()) @db.Timestamptz(3)
+
+  @@id([eventId, consumerName])
+}

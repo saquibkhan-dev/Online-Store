@@ -1,0 +1,16 @@
+# Local development overrides: docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+# NEVER use this file in a shared or production environment: it enables the payment sandbox.
+services:
+  nginx:
+    environment:
+      FORCE_HTTPS: "false"
+  postgres:
+    ports: ["127.0.0.1:5432:5432"]
+  api-gateway:
+    ports: ["127.0.0.1:4000:4000"]
+    environment:
+      NODE_ENV: development
+  web:
+    environment:
+      SANDBOX_PAYMENTS: "true"
+      PAYMENT_WEBHOOK_SECRET: ${PAYMENT_WEBHOOK_SECRET:?set PAYMENT_WEBHOOK_SECRET}

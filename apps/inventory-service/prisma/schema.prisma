@@ -1,0 +1,81 @@
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated"
+  moduleFormat = "cjs"
+  engineType   = "client"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum ReservationStatus {
+  RESERVED
+  RELEASED
+  CONFIRMED
+  EXPIRED
+}
+
+/// Authoritative stock. available = quantity - reservedQuantity; the DB enforces 0 <= reserved <= quantity.
+model Inventory {
+  id               String   @id @default(uuid()) @db.Uuid
+  productId        String   @unique @db.Uuid
+  quantity         Int
+  reservedQuantity Int      @default(0)
+  version          Int      @default(0)
+  updatedAt        DateTime @updatedAt @db.Timestamptz(3)
+}
+
+model InventoryReservation {
+  id        String            @id @default(uuid()) @db.Uuid
+  orderId   String            @unique @db.Uuid
+  status    ReservationStatus @default(RESERVED)
+  expiresAt DateTime          @db.Timestamptz(3)
+  createdAt DateTime          @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime          @updatedAt @db.Timestamptz(3)
+  items     ReservationItem[]
+
+  @@index([status, expiresAt])
+}
+
+model ReservationItem {
+  id            String               @id @default(uuid()) @db.Uuid
+  reservationId String               @db.Uuid
+  productId     String               @db.Uuid
+  quantity      Int
+  reservation   InventoryReservation @relation(fields: [reservationId], references: [id], onDelete: Cascade)
+
+  @@unique([reservationId, productId])
+}
+
+/// Transactional outbox: written in the same transaction as the state change, published to Kafka by the relay.
+model OutboxEvent {
+  id            String    @id @default(uuid()) @db.Uuid
+  eventId       String    @unique @db.Uuid
+  eventType     String
+  aggregateId   String    @db.Uuid
+  version       Int       @default(1)
+  correlationId String    @db.Uuid
+  causationId   String?   @db.Uuid
+  payload       Json
+  status        String    @default("PENDING")
+  retryCount    Int       @default(0)
+  nextAttemptAt DateTime  @default(now()) @db.Timestamptz(3)
+  lockedUntil   DateTime? @db.Timestamptz(3)
+  lastAttemptAt DateTime? @db.Timestamptz(3)
+  lastError     String?
+  publishedAt   DateTime? @db.Timestamptz(3)
+  createdAt     DateTime  @default(now()) @db.Timestamptz(3)
+
+  @@index([status, nextAttemptAt, createdAt])
+}
+
+/// Consumer deduplication: inserting (eventId, consumerName) is the first step of every handler transaction.
+model ProcessedEvent {
+  eventId      String   @db.Uuid
+  consumerName String
+  processedAt  DateTime @default(now()) @db.Timestamptz(3)
+
+  @@id([eventId, consumerName])
+}

@@ -1,0 +1,93 @@
+# Rendered by the nginx image at start-up (envsubst replaces ONLY ${FORCE_HTTPS}; nginx's own $variables are untouched).
+# This file lives in /etc/nginx/conf.d, i.e. inside the http {} context of the stock nginx.conf.
+
+server_tokens off;
+client_max_body_size 1m;
+client_body_timeout 15s;
+client_header_timeout 15s;
+send_timeout 30s;
+
+gzip on;
+gzip_vary on;
+gzip_proxied any;
+gzip_comp_level 5;
+gzip_min_length 512;
+gzip_types application/json text/css application/javascript text/plain image/svg+xml application/xml;
+
+# Docker's embedded DNS. Using variables in proxy_pass makes nginx re-resolve the service name every 10 s, so
+# `docker compose up --scale web=3 --scale api-gateway=3` is load-balanced round-robin across the replicas.
+# (Kubernetes/ECS: replace with the platform's resolver, or put a cloud load balancer in front.)
+resolver 127.0.0.11 valid=10s ipv6=off;
+
+proxy_cache_path /var/cache/nginx/api    levels=1:2 keys_zone=api_cache:10m    max_size=100m inactive=10m use_temp_path=off;
+proxy_cache_path /var/cache/nginx/static levels=1:2 keys_zone=static_cache:10m max_size=200m inactive=30d use_temp_path=off;
+
+# The scheme the VISITOR used. Behind a TLS-terminating load balancer that is its X-Forwarded-Proto; with no
+# balancer it is whatever reached this nginx. Never taken from the client when we are the edge.
+map $http_x_forwarded_proto $edge_proto {
+  default $http_x_forwarded_proto;
+  ""      $scheme;
+}
+
+# Force HTTPS (FORCE_HTTPS=true) for everything except the load-balancer health probe.
+map "$uri:$edge_proto:${FORCE_HTTPS}" $must_redirect {
+  default           0;
+  "~^/healthz:"     0;
+  "~^[^:]*:http:true$" 1;
+}
+
+server {
+  listen 8080;
+
+  if ($must_redirect) { return 308 https://$host$request_uri; }
+
+  set $web     http://web:3000;
+  set $gateway http://api-gateway:4000;
+
+  proxy_http_version 1.1;
+  proxy_set_header Connection "";
+  proxy_set_header Host $host;
+  # Replace (never append) so clients cannot forge the address the gateway rate-limits on.
+  # Behind a cloud LB, also set `set_real_ip_from <LB CIDR>; real_ip_header X-Forwarded-For;` so $remote_addr is the visitor.
+  proxy_set_header X-Forwarded-For $remote_addr;
+  proxy_set_header X-Forwarded-Proto $edge_proto;
+  proxy_set_header X-Edge-Proto $edge_proto;
+  proxy_connect_timeout 3s;
+  proxy_read_timeout 30s;
+
+  add_header X-Content-Type-Options nosniff always;
+  add_header Referrer-Policy strict-origin-when-cross-origin always;
+  add_header Strict-Transport-Security "max-age=63072000; includeSubDomains" always;
+
+  location = /healthz { access_log off; default_type text/plain; return 200 "ok\n"; }
+
+  # Internal endpoints and metrics must never be reachable from outside.
+  location ~ ^/(internal|metrics|ready) { return 404; }
+
+  # Public catalogue reads are identical for every visitor, so absorb traffic spikes at the edge for a few seconds.
+  # The gateway marks ONLY these responses `Cache-Control: public`; everything else is no-store and never cached.
+  location ~ "^/api/(products|categories)(/[0-9a-f-]{36})?$" {
+    proxy_pass $gateway;
+    proxy_cache api_cache;
+    proxy_cache_methods GET HEAD;
+    proxy_cache_key "$request_uri";
+    proxy_cache_lock on;
+    proxy_cache_use_stale error timeout updating http_502 http_503 http_504;
+    proxy_cache_background_update on;
+    add_header X-Cache-Status $upstream_cache_status always;
+  }
+
+  # Public API (mobile apps, partners, payment-provider webhooks). The browser app uses /bff via the web container.
+  location /api/ { proxy_pass $gateway; }
+
+  # Fingerprinted build assets never change: cache for a year (also the natural place to point a CDN).
+  location /_next/static/ {
+    proxy_pass $web;
+    proxy_cache static_cache;
+    proxy_cache_valid 200 365d;
+    add_header Cache-Control "public, max-age=31536000, immutable" always;
+    add_header X-Content-Type-Options nosniff always;
+  }
+
+  location / { proxy_pass $web; }
+}

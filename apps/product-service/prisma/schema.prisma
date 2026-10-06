@@ -1,0 +1,49 @@
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated"
+  moduleFormat = "cjs"
+  engineType   = "client"
+  previewFeatures = ["postgresqlExtensions"]
+}
+
+datasource db {
+  provider   = "postgresql"
+  url        = env("DATABASE_URL")
+  extensions = [pg_trgm]
+}
+
+enum ProductStatus {
+  ACTIVE
+  DELETED
+}
+
+model Category {
+  id        String    @id @default(uuid()) @db.Uuid
+  name      String
+  slug      String    @unique
+  createdAt DateTime  @default(now()) @db.Timestamptz(3)
+  updatedAt DateTime  @updatedAt @db.Timestamptz(3)
+  products  Product[]
+}
+
+/// Prices are integer minor units (paise/cents); the DB also enforces priceMinor >= 0.
+model Product {
+  id          String        @id @default(uuid()) @db.Uuid
+  categoryId  String?       @db.Uuid
+  name        String
+  slug        String        @unique
+  description String        @default("")
+  priceMinor  Int
+  currency    String        @default("INR") @db.Char(3)
+  status      ProductStatus @default(ACTIVE)
+  createdAt   DateTime      @default(now()) @db.Timestamptz(3)
+  updatedAt   DateTime      @updatedAt @db.Timestamptz(3)
+  category    Category?     @relation(fields: [categoryId], references: [id], onDelete: SetNull)
+
+  @@index([categoryId])
+  @@index([status, createdAt])
+  @@index([status, priceMinor])
+  // Substring search (ILIKE '%term%') cannot use a B-tree; trigram GIN indexes make it index-assisted.
+  @@index([name(ops: raw("gin_trgm_ops"))], type: Gin, map: "Product_name_trgm_idx")
+  @@index([description(ops: raw("gin_trgm_ops"))], type: Gin, map: "Product_description_trgm_idx")
+}

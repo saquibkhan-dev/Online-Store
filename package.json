@@ -1,0 +1,40 @@
+{
+  "name": "event-driven-ecommerce-platform",
+  "private": true,
+  "packageManager": "pnpm@10.12.1",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "pnpm --parallel --filter './apps/*' dev",
+    "build": "pnpm --filter @commerce/shared build && pnpm -r build",
+    "lint": "eslint .",
+    "typecheck": "pnpm --filter @commerce/shared build && pnpm -r typecheck",
+    "test": "pnpm --filter @commerce/shared build && pnpm -r --workspace-concurrency=1 test",
+    "test:db:setup": "sh scripts/test-db.sh",
+    "e2e": "pnpm --filter @commerce/web test:e2e"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.36.0",
+    "eslint": "^9.36.0",
+    "typescript": "^5.8.3",
+    "typescript-eslint": "^8.44.0",
+    "eslint-plugin-jsx-a11y": "^6.10.2"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "prisma",
+      "@prisma/engines",
+      "esbuild"
+    ],
+    "overrides": {
+      "postcss": ">=8.5.23"
+    },
+    "auditConfig": {
+      "ignoreGhsas": [
+        "GHSA-vfj7-8cjw-p6xm",
+        "GHSA-ggr8-5vv4-36mx"
+      ]
+    }
+  }
+}
